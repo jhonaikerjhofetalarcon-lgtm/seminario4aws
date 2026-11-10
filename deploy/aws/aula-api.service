@@ -1,0 +1,25 @@
+[Unit]
+Description=Aula - API academica de Go
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=aula-api
+Group=aula-api
+WorkingDirectory=/opt/aula
+EnvironmentFile=/etc/aula/backend.env
+Environment=ALMACENAMIENTO=supabase
+Environment=DIRECCION_HTTP=127.0.0.1:8080
+Environment=SUPABASE_SECRET_KEY_FILE=/etc/aula/supabase_key.txt
+ExecStart=/opt/aula/academia
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

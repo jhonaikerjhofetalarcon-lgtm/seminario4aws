@@ -1,0 +1,79 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Aula: EC2 independiente, administracion SSM y enlace HTTPS CloudFront sin dominio propio.",
+  "Parameters": {
+    "VpcId": {"Type": "AWS::EC2::VPC::Id"},
+    "SubnetId": {"Type": "AWS::EC2::Subnet::Id"},
+    "CloudFrontPrefixList": {"Type": "String", "AllowedPattern": "pl-[a-z0-9]+"},
+    "InstanceType": {"Type": "String", "Default": "t3.small", "AllowedValues": ["t3.small", "t3.medium"]},
+    "LatestAmiId": {"Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>", "Default": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"}
+  },
+  "Resources": {
+    "Paquetes": {
+      "Type": "AWS::S3::Bucket", "DeletionPolicy": "Retain", "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "PublicAccessBlockConfiguration": {"BlockPublicAcls": true, "IgnorePublicAcls": true, "BlockPublicPolicy": true, "RestrictPublicBuckets": true},
+        "BucketEncryption": {"ServerSideEncryptionConfiguration": [{"ServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]},
+        "VersioningConfiguration": {"Status": "Enabled"},
+        "LifecycleConfiguration": {"Rules": [{"Id": "ConfiguracionTemporal", "Status": "Enabled", "Prefix": "instalacion/configuracion-", "ExpirationInDays": 1, "NoncurrentVersionExpiration": {"NoncurrentDays": 1}}]}
+      }
+    },
+    "PoliticaPaquetes": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {"Bucket": {"Ref": "Paquetes"}, "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": [{"Fn::GetAtt": ["Paquetes", "Arn"]}, {"Fn::Sub": "${Paquetes.Arn}/*"}], "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]}}
+    },
+    "RolInstancia": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]},
+        "ManagedPolicyArns": [{"Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"}],
+        "Policies": [{"PolicyName": "LeerInstalacionAula", "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:GetObject", "Resource": {"Fn::Sub": "${Paquetes.Arn}/instalacion/*"}}]}}]
+      }
+    },
+    "PerfilInstancia": {"Type": "AWS::IAM::InstanceProfile", "Properties": {"Roles": [{"Ref": "RolInstancia"}]}},
+    "GrupoSeguridad": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Origen HTTP accesible solo desde CloudFront; administracion mediante SSM sin SSH",
+        "VpcId": {"Ref": "VpcId"},
+        "SecurityGroupIngress": [{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "SourcePrefixListId": {"Ref": "CloudFrontPrefixList"}}]
+      }
+    },
+    "Servidor": {
+      "Type": "AWS::EC2::Instance",
+      "Properties": {
+        "ImageId": {"Ref": "LatestAmiId"}, "InstanceType": {"Ref": "InstanceType"},
+        "IamInstanceProfile": {"Ref": "PerfilInstancia"},
+        "MetadataOptions": {"HttpTokens": "required", "HttpPutResponseHopLimit": 1},
+        "NetworkInterfaces": [{"DeviceIndex": "0", "AssociatePublicIpAddress": true, "SubnetId": {"Ref": "SubnetId"}, "GroupSet": [{"Ref": "GrupoSeguridad"}]}],
+        "BlockDeviceMappings": [{"DeviceName": "/dev/xvda", "Ebs": {"VolumeSize": 20, "VolumeType": "gp3", "Encrypted": true, "DeleteOnTermination": true}}],
+        "Tags": [{"Key": "Name", "Value": {"Fn::Sub": "${AWS::StackName}-matriculas"}}],
+        "UserData": {"Fn::Base64": "#!/bin/bash\nset -euo pipefail\ndnf install -y unzip tar\ncommand -v aws || dnf install -y awscli2\nsystemctl enable --now amazon-ssm-agent\ntouch /home/ec2-user/aula-servidor-listo\n"}
+      }
+    },
+    "Sitio": {
+      "Type": "AWS::CloudFront::Distribution",
+      "Properties": {
+        "DistributionConfig": {
+          "Enabled": true, "Comment": {"Fn::Sub": "${AWS::StackName}: sistema de matriculas"},
+          "DefaultRootObject": "index.html", "HttpVersion": "http2and3", "IPV6Enabled": true, "PriceClass": "PriceClass_100",
+          "Origins": [{"Id": "aula", "DomainName": {"Fn::GetAtt": ["Servidor", "PublicDnsName"]}, "CustomOriginConfig": {"HTTPPort": 80, "HTTPSPort": 443, "OriginProtocolPolicy": "http-only", "OriginSSLProtocols": ["TLSv1.2"]}}],
+          "DefaultCacheBehavior": {
+            "TargetOriginId": "aula", "ViewerProtocolPolicy": "redirect-to-https", "Compress": true,
+            "AllowedMethods": ["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"], "CachedMethods": ["GET", "HEAD"],
+            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0,
+            "ForwardedValues": {"QueryString": true, "Cookies": {"Forward": "all"}, "Headers": ["Origin", "Access-Control-Request-Headers", "Access-Control-Request-Method"]}
+          },
+          "CustomErrorResponses": [{"ErrorCode": 403, "ErrorCachingMinTTL": 0}, {"ErrorCode": 404, "ErrorCachingMinTTL": 0}, {"ErrorCode": 502, "ErrorCachingMinTTL": 0}],
+          "ViewerCertificate": {"CloudFrontDefaultCertificate": true}
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "Url": {"Description": "Enlace HTTPS publico del sistema", "Value": {"Fn::Sub": "https://${Sitio.DomainName}"}},
+    "InstanceId": {"Description": "Servidor administrado mediante SSM", "Value": {"Ref": "Servidor"}},
+    "Bucket": {"Description": "Bucket privado de instalacion", "Value": {"Ref": "Paquetes"}},
+    "DistributionId": {"Description": "Distribucion CloudFront", "Value": {"Ref": "Sitio"}}
+  }
+}
